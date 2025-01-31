@@ -1,68 +1,103 @@
 package main
 
 import (
-	
+	"database/sql"
+	"encoding/json"
 	"fmt"
+	"io"
 	"log"
 	"net/http"
-	"database/sql"
-	"time"
-	"io"
-	"encoding/json"
 	"os"
-	"github.com/golang-jwt/jwt"
+	"path/filepath"
 	"strings"
+	"time"
+
+	"github.com/golang-jwt/jwt"
 
 	_ "github.com/lib/pq"
 	"github.com/rs/cors"
-	
+
 	"github.com/gorilla/mux"
 
-	
-	
+	"github.com/joho/godotenv"
 
-	
+	"golang.org/x/crypto/bcrypt"
 )
-var secretKey = []byte("theSecretKey")
+
 
 func connectToDB() *sql.DB {
-	connStr := "user=user password=password dbname=personal_cloud sslmode=disable"
+	err := godotenv.Load()
+	if err != nil {
+		log.Println("Warning: No .env file found")
+	}
+
+	connStr := os.Getenv("DATABASE_URL")
 	db, err := sql.Open("postgres", connStr)
 	if err != nil {
 		log.Fatal(err)
 	}
 
 	if err := db.Ping(); err != nil {
-		log.Fatal("Error pinging database", err)
+		log.Fatal("Error pinging database:", err)
 	}
 	return db
 }
 
+func hashPassword(password string) (string, error) {
+	hashedPassword, err := bcrypt.GenerateFromPassword([]byte(password), bcrypt.DefaultCost)
+	return string(hashedPassword), err
+}
+
+func checkPassword(hashedPassword, password string) bool {
+	return bcrypt.CompareHashAndPassword([]byte(hashedPassword), []byte(password)) == nil
+}
+var secretKey = []byte("theSecretKey")
+
+
+
 func jwtMiddleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		tokenString := r.Header.Get("Authorization")
-		if tokenString == "" {
-			http.Error(w, "missing token", http.StatusUnauthorized)
+		if tokenString == "" || !strings.HasPrefix(tokenString, "Bearer") {
+			http.Error(w, "missing or invalid token", http.StatusUnauthorized)
 			return
 		}
 
-		if !strings.HasPrefix(tokenString, "Bearer ") {
-			http.Error(w, "Invalid token format", http.StatusUnauthorized)
-			return
-		}
-
-		tokenString = tokenString[len("Bearer "):]
+		tokenString = strings.TrimPrefix(tokenString, "Bearer ")
 		
 		token, err := jwt.Parse(tokenString, func(token *jwt.Token) (interface{}, error){
 			return secretKey, nil
 		})
+
 		if err != nil || !token.Valid {
 			http.Error(w, "Invalid token", http.StatusUnauthorized)
+			return
+		}
+
+		claims, ok := token.Claims.(jwt.MapClaims)
+
+		if !ok {
+			http.Error( w, "Invalid token claims", http.StatusUnauthorized)
+			return
+		}
+
+		if exp, ok := claims["exp"].(float64); && int64(exp) < time.Now().Unix() {
+			http.Error(w, "Token expired", http.STatusUnauthorized)
 			return
 		}
 		next.ServeHTTP(w, r)
 	})
 }
+
+func generateJWT(username string) (string, error) {
+	claims := jwt.MapClaims{
+		"username": username,
+		"exp": time.Now().Add(time.Hour * 24).Unix(),
+
+
+	token := jwt.NewWithClaims(jwt.SigningMethodHS256, claims)
+	return token.SignedString(secretKey)
+	}
 
 func loginHandler(w http.ResponseWriter, r *http.Request, db *sql.DB) {
 	r.ParseForm()
@@ -82,59 +117,57 @@ func loginHandler(w http.ResponseWriter, r *http.Request, db *sql.DB) {
 		return
 	}
 
-	if storedPassword == password {
-		tokenString, err := generateJWT(username)
-		if err != nil {
-			http.Error(w, "Error creating JWT token", http.StatusInternalServerError)
-			return
-		}
-		w.Header().Set("Content-Type", "application/json")
-		w.WriteHeader(http.StatusOK)
-		json.NewEncoder(w).Encode(map[string]string{
-			"token": tokenString,
-		})
-	} else {
+	if !checkPassword(storedPassword, password) {
 		http.Error(w, "Invalid credentials", http.StatusUnauthorized)
+		return
 	}
-}
 
-func generateJWT(username string) (string, error) {
-	claims := jwt.MapClaims{}
-	claims["username"] = username
-	claims["exp"] = time.Now().Add(time.Hour * 24).Unix()
-	token := jwt.NewWithClaims(jwt.SigningMethodHS256, claims)
-	tokenString, err := token.SignedString(secretKey)
-
+	tokenString, err := generate(username)
 	if err != nil {
-		return "", err
+		http.Error(w, "Error creating JWT token", http.StatusInternalServerError)
+		return
 	}
-	return tokenString, nil
+
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusOK)
+	json.NewEncoder(w).Encode(map[string]string{
+		"token": tokenString,
+	})
 }
+
 
 func uploadHandler(w http.ResponseWriter, r *http.Request) {
-	err := r.ParseMultipartForm(10 << 20)
+	err := r.ParseMultipartForum(10 << 20)
 	if err != nil {
 		http.Error(w, "Error parsing the form", http.StatusBadRequest)
 		return
 	}
 
-	file, _, err := r.FormFile("file")
+	file, header, err := r.formFile("file")
 	if err != nil {
 		http.Error(w, "Error retrieving the file", http.StatusBadRequest)
 		return
 	}
 	defer file.Close()
 
-	filePath := "./uploads/" + "file_" + fmt.Sprintf("%d", time.Now().Unix()) + ".txt"
-	dst, err := os.Create(filePath)
+	fileType := header.Header.Get("Content-Type")
+	allowedTypes := map[string]bool{"image/png":true, "image/jpeg": true, "application/pdf": true}
+	if !allowedTypes[fileType] {
+		http.Error(w, "Invalid file type", http.StatusBadRequest)
+		return
+	}
 
+	safeFilename := fmt.Sprintf("file_%d%s", time.Now().Unix(), filepath.Ext(header.Filename))
+	filePath := filepath.Join("./uploads/", safeFilename)
+
+	dst, err := os.Create(filePath)
 	if err != nil {
-		http.Error(w, "Error saving the file", http.StatusInternalServerError)
+		http.Error(w, "Error saving the file", http.StatusInternalServerERror)
 		return
 	}
 	defer dst.Close()
 
-	_, err = io.Copy(dst, file)
+	_, err = io.Copy(dst,file)
 	if err != nil {
 		http.Error(w, "Error saving the file", http.StatusInternalServerError)
 		return
@@ -144,14 +177,13 @@ func uploadHandler(w http.ResponseWriter, r *http.Request) {
 }
 
 func downloadHandler(w http.ResponseWriter, r *http.Request) {
-	fileID := strings.TrimPrefix(r.URL.Path, "/download/")
+	vars := mux.Vars(r)
+	fileID := vars["fileID"]
 
-	filePath := "./uploads/" + fileID
-
+	filePath := filepath.Join("./uploads/", fileID)
 	file, err := os.Open(filePath)
-
 	if err != nil {
-		http.Error(w, "File not found", http.StatusNotFound)
+		http.Error(w, "file not found", http.StatusNotFound)
 		return
 	}
 	defer file.Close()
@@ -162,7 +194,6 @@ func downloadHandler(w http.ResponseWriter, r *http.Request) {
 	_, err = io.Copy(w, file)
 	if err != nil {
 		http.Error(w, "Error downloading the file", http.StatusInternalServerError)
-		return
 	}
 
 }
@@ -216,6 +247,6 @@ func main() {
 	handler := corsHandler.Handler(r)
 
 	port := ":8080"
-	fmt.Printf("Server started at http://localhost/%s\n", port)
+	fmt.Printf("Server started at http://localhost%s\n", port)
 	log.Fatal(http.ListenAndServe(port, handler))
 }
